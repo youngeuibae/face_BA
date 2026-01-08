@@ -309,8 +309,50 @@ def add_label(frame, text, position='top'):
     
     return frame
 
+def get_alignment_transform(before_info, after_info, target_w, target_h):
+    """after 기준으로 before를 정렬하는 변환 행렬 계산"""
+    bi, ai = before_info, after_info
+    
+    is_half = ai['is_half_face']
+    
+    if is_half:
+        # 반모: 정중선 기준
+        scale = ai['midline_length'] / bi['midline_length']
+        scale = np.clip(scale, 0.8, 1.25)
+        
+        angle_rad = ai['midline_angle'] - bi['midline_angle']
+        angle_deg = -np.degrees(angle_rad)
+        angle_deg = np.clip(angle_deg, -10, 10)
+        
+        ax, ay = bi['midline_center_x'], bi['midline_center_y']
+        tx, ty = ai['midline_center_x'], ai['midline_center_y']
+    else:
+        # 안모: 눈 기준
+        scale = ai['eye_dist'] / bi['eye_dist']
+        scale = np.clip(scale, 0.8, 1.25)
+        
+        angle_rad = ai['eye_angle'] - bi['eye_angle']
+        angle_deg = -np.degrees(angle_rad)
+        angle_deg = np.clip(angle_deg, -10, 10)
+        
+        ax, ay = bi['eyes_center_x'], bi['eyes_center_y']
+        tx, ty = ai['eyes_center_x'], ai['eyes_center_y']
+    
+    # 변환 행렬 생성
+    M = cv2.getRotationMatrix2D((ax, ay), angle_deg, scale)
+    
+    # 변환 후 앵커 위치
+    nax = M[0,0]*ax + M[0,1]*ay + M[0,2]
+    nay = M[1,0]*ax + M[1,1]*ay + M[1,2]
+    
+    # 타겟 위치로 이동
+    M[0,2] += tx - nax
+    M[1,2] += ty - nay
+    
+    return M, "반모(정중선)" if is_half else "안모(눈)"
+
 def create_side_by_side_video(before_video, after_video, add_labels=True):
-    """두 영상을 좌우로 붙여서 출력"""
+    """두 영상을 좌우로 붙여서 출력 (얼굴 정렬 포함)"""
     if before_video is None or after_video is None:
         return None, "전/후 영상을 모두 업로드해주세요"
     
@@ -324,46 +366,48 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
         # 영상 정보 가져오기
         fps_before = cap_before.get(cv2.CAP_PROP_FPS)
         fps_after = cap_after.get(cv2.CAP_PROP_FPS)
-        fps = min(fps_before, fps_after, 30)  # 최대 30fps
+        fps = min(fps_before, fps_after, 30)
         
         frame_count_before = int(cap_before.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_count_after = int(cap_after.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # 첫 프레임으로 크기 결정
-        ret_b, frame_b = cap_before.read()
-        ret_a, frame_a = cap_after.read()
+        # 첫 프레임으로 얼굴 정보 추출
+        ret_b, first_frame_b = cap_before.read()
+        ret_a, first_frame_a = cap_after.read()
         
         if not ret_b or not ret_a:
             return None, "영상 프레임을 읽을 수 없습니다"
         
         # 리사이즈
-        frame_b = resize_video_frame(frame_b, VIDEO_MAX_SIZE)
-        frame_a = resize_video_frame(frame_a, VIDEO_MAX_SIZE)
+        first_frame_b = resize_video_frame(first_frame_b, VIDEO_MAX_SIZE)
+        first_frame_a = resize_video_frame(first_frame_a, VIDEO_MAX_SIZE)
         
-        h_b, w_b = frame_b.shape[:2]
-        h_a, w_a = frame_a.shape[:2]
+        h_b, w_b = first_frame_b.shape[:2]
+        h_a, w_a = first_frame_a.shape[:2]
         
-        # 높이 맞추기
-        target_h = max(h_b, h_a)
-        if h_b != target_h:
-            scale = target_h / h_b
-            w_b = int(w_b * scale)
-            frame_b = cv2.resize(frame_b, (w_b, target_h), interpolation=cv2.INTER_LANCZOS4)
-        if h_a != target_h:
-            scale = target_h / h_a
-            w_a = int(w_a * scale)
-            frame_a = cv2.resize(frame_a, (w_a, target_h), interpolation=cv2.INTER_LANCZOS4)
+        # 높이 맞추기 (after 기준)
+        target_h = h_a
+        scale_b = target_h / h_b
+        w_b_scaled = int(w_b * scale_b)
+        
+        # 얼굴 정보 추출 (리사이즈된 프레임에서)
+        frame_b_scaled = cv2.resize(first_frame_b, (w_b_scaled, target_h), interpolation=cv2.INTER_LANCZOS4)
+        
+        before_info = get_face_info(frame_b_scaled)
+        after_info = get_face_info(first_frame_a)
+        
+        # 정렬 변환 행렬 계산
+        M, align_type = get_alignment_transform(before_info, after_info, w_a, target_h)
         
         # 구분선 너비
         divider_width = 4
         
         # 최종 크기 (16의 배수로)
-        final_w = ((w_b + w_a + divider_width) // 16) * 16
+        final_w = ((w_a * 2 + divider_width) // 16) * 16
         final_h = (target_h // 16) * 16
         
-        # 다시 계산
-        w_b_adj = (final_w - divider_width) // 2
-        w_a_adj = final_w - divider_width - w_b_adj
+        # 각 패널 크기
+        panel_w = (final_w - divider_width) // 2
         
         cap_before.set(cv2.CAP_PROP_POS_FRAMES, 0)
         cap_after.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -374,7 +418,6 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (final_w, final_h))
         
-        # 프레임 동기화를 위한 계산
         max_frames = max(frame_count_before, frame_count_after)
         
         frame_idx = 0
@@ -401,20 +444,33 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
             if frame_b is None or frame_a is None:
                 break
             
-            # 리사이즈
-            frame_b_resized = cv2.resize(frame_b, (w_b_adj, final_h), interpolation=cv2.INTER_LANCZOS4)
-            frame_a_resized = cv2.resize(frame_a, (w_a_adj, final_h), interpolation=cv2.INTER_LANCZOS4)
+            # Before 프레임 처리: 리사이즈 → 정렬 변환 → 패널 크기로 조정
+            frame_b_resized = resize_video_frame(frame_b, VIDEO_MAX_SIZE)
+            frame_b_scaled = cv2.resize(frame_b_resized, (w_b_scaled, target_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 정렬 변환 적용
+            frame_b_aligned = cv2.warpAffine(frame_b_scaled, M, (w_a, target_h),
+                                              borderMode=cv2.BORDER_CONSTANT,
+                                              borderValue=(255, 255, 255))
+            
+            # After 프레임 처리
+            frame_a_resized = resize_video_frame(frame_a, VIDEO_MAX_SIZE)
+            frame_a_final = cv2.resize(frame_a_resized, (w_a, target_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 최종 패널 크기로 조정
+            frame_b_panel = cv2.resize(frame_b_aligned, (panel_w, final_h), interpolation=cv2.INTER_LANCZOS4)
+            frame_a_panel = cv2.resize(frame_a_final, (panel_w, final_h), interpolation=cv2.INTER_LANCZOS4)
             
             # 라벨 추가
             if add_labels:
-                frame_b_resized = add_label(frame_b_resized, "BEFORE", 'top')
-                frame_a_resized = add_label(frame_a_resized, "AFTER", 'top')
+                frame_b_panel = add_label(frame_b_panel, "BEFORE", 'top')
+                frame_a_panel = add_label(frame_a_panel, "AFTER", 'top')
             
             # 합치기
             combined = np.zeros((final_h, final_w, 3), dtype=np.uint8)
-            combined[:, :w_b_adj] = frame_b_resized
-            combined[:, w_b_adj:w_b_adj+divider_width] = [255, 255, 255]  # 흰색 구분선
-            combined[:, w_b_adj+divider_width:] = frame_a_resized
+            combined[:, :panel_w] = frame_b_panel
+            combined[:, panel_w:panel_w+divider_width] = [255, 255, 255]
+            combined[:, panel_w+divider_width:panel_w+divider_width+panel_w] = frame_a_panel
             
             out.write(combined)
             frame_idx += 1
@@ -424,7 +480,9 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
         out.release()
         
         duration = max_frames / fps
-        return output_path, f"{final_w}×{final_h} | {duration:.1f}초 | {max_frames}프레임"
+        detect_b = "✓" if before_info['detected'] else "✗"
+        detect_a = "✓" if after_info['detected'] else "✗"
+        return output_path, f"{final_w}×{final_h} | {duration:.1f}초 | {align_type}\n얼굴 검출: 전({detect_b}) 후({detect_a})"
     
     except Exception as e:
         import traceback
