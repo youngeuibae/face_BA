@@ -3,6 +3,8 @@ import cv2
 import numpy as np
 import tempfile
 import os
+import subprocess
+import json
 
 MAX_SIZE = 1920
 VIDEO_MAX_SIZE = 720
@@ -271,6 +273,40 @@ def create_video(before_img, after_img, logo_img=None):
 
 # ============ 영상 비교 (Side by Side) ============
 
+def get_video_rotation(video_path):
+    """ffprobe를 사용해 영상의 회전 메타데이터 확인"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_streams', '-select_streams', 'v:0', video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if 'streams' in data and len(data['streams']) > 0:
+                stream = data['streams'][0]
+                # rotation in side_data_list
+                if 'side_data_list' in stream:
+                    for side_data in stream['side_data_list']:
+                        if 'rotation' in side_data:
+                            return int(side_data['rotation'])
+                # rotation as direct tag
+                if 'tags' in stream and 'rotate' in stream['tags']:
+                    return int(stream['tags']['rotate'])
+    except Exception as e:
+        print(f"ffprobe error: {e}")
+    return 0
+
+def rotate_frame(frame, rotation):
+    """회전 각도에 따라 프레임 회전"""
+    if rotation == 90 or rotation == -270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation == -90 or rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180 or rotation == -180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    return frame
+
 def resize_video_frame(frame, max_size):
     """프레임을 최대 크기에 맞게 리사이즈"""
     h, w = frame.shape[:2]
@@ -352,11 +388,15 @@ def get_alignment_transform(before_info, after_info, target_w, target_h):
     return M, "반모(정중선)" if is_half else "안모(눈)"
 
 def create_side_by_side_video(before_video, after_video, add_labels=True):
-    """두 영상을 좌우로 붙여서 출력 (얼굴 정렬 포함)"""
+    """두 영상을 좌우로 붙여서 출력 (얼굴 정렬 + 회전 보정 포함)"""
     if before_video is None or after_video is None:
         return None, "전/후 영상을 모두 업로드해주세요"
     
     try:
+        # 회전 메타데이터 확인
+        rotation_b = get_video_rotation(before_video)
+        rotation_a = get_video_rotation(after_video)
+        
         cap_before = cv2.VideoCapture(before_video)
         cap_after = cv2.VideoCapture(after_video)
         
@@ -377,6 +417,10 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
         
         if not ret_b or not ret_a:
             return None, "영상 프레임을 읽을 수 없습니다"
+        
+        # 회전 보정 적용
+        first_frame_b = rotate_frame(first_frame_b, rotation_b)
+        first_frame_a = rotate_frame(first_frame_a, rotation_a)
         
         # 리사이즈
         first_frame_b = resize_video_frame(first_frame_b, VIDEO_MAX_SIZE)
@@ -429,6 +473,7 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
             if frame_idx < frame_count_before:
                 ret_b, frame_b = cap_before.read()
                 if ret_b:
+                    frame_b = rotate_frame(frame_b, rotation_b)  # 회전 보정
                     last_frame_b = frame_b.copy()
             else:
                 frame_b = last_frame_b
@@ -437,6 +482,7 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
             if frame_idx < frame_count_after:
                 ret_a, frame_a = cap_after.read()
                 if ret_a:
+                    frame_a = rotate_frame(frame_a, rotation_a)  # 회전 보정
                     last_frame_a = frame_a.copy()
             else:
                 frame_a = last_frame_a
@@ -482,7 +528,8 @@ def create_side_by_side_video(before_video, after_video, add_labels=True):
         duration = max_frames / fps
         detect_b = "✓" if before_info['detected'] else "✗"
         detect_a = "✓" if after_info['detected'] else "✗"
-        return output_path, f"{final_w}×{final_h} | {duration:.1f}초 | {align_type}\n얼굴 검출: 전({detect_b}) 후({detect_a})"
+        rot_info = f" | 회전보정: B({rotation_b}°) A({rotation_a}°)" if rotation_b != 0 or rotation_a != 0 else ""
+        return output_path, f"{final_w}×{final_h} | {duration:.1f}초 | {align_type}{rot_info}\n얼굴 검출: 전({detect_b}) 후({detect_a})"
     
     except Exception as e:
         import traceback
@@ -526,7 +573,7 @@ with gr.Blocks(title="Dental B&A", css=custom_css) as demo:
         
         # ===== 탭 2: 영상 비교 (새로 추가) =====
         with gr.TabItem("🎬 영상 비교"):
-            gr.Markdown("<p style='text-align:center;color:#666'>전/후 영상을 좌우로 붙여서 비교</p>")
+            gr.Markdown("<p style='text-align:center;color:#666'>전/후 영상을 좌우로 붙여서 비교 (자동 회전 보정)</p>")
             
             with gr.Row():
                 before_video_input = gr.Video(label="BEFORE 영상")
