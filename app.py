@@ -5,6 +5,7 @@ import tempfile
 import os
 
 MAX_SIZE = 1920
+VIDEO_MAX_SIZE = 720
 
 def resize_and_crop_to_match(img1, img2):
     h1, w1 = img1.shape[:2]
@@ -267,32 +268,225 @@ def create_video(before_img, after_img, logo_img=None):
     except Exception as e:
         return None, f"오류: {str(e)}"
 
+
+# ============ 영상 비교 (Side by Side) ============
+
+def resize_video_frame(frame, max_size):
+    """프레임을 최대 크기에 맞게 리사이즈"""
+    h, w = frame.shape[:2]
+    if max(h, w) > max_size:
+        if w > h:
+            new_w = max_size
+            new_h = int(h * max_size / w)
+        else:
+            new_h = max_size
+            new_w = int(w * max_size / h)
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    return frame
+
+def add_label(frame, text, position='top'):
+    """프레임에 라벨 추가"""
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.8, min(w, h) / 500)
+    thickness = max(2, int(font_scale * 2))
+    
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    
+    padding = 10
+    if position == 'top':
+        x = (w - text_w) // 2
+        y = text_h + padding + 20
+    else:
+        x = (w - text_w) // 2
+        y = h - padding - 20
+    
+    # 배경 박스
+    cv2.rectangle(frame, (x - padding, y - text_h - padding), 
+                  (x + text_w + padding, y + baseline + padding), (0, 0, 0), -1)
+    # 텍스트
+    cv2.putText(frame, text, (x, y), font, font_scale, (255, 255, 255), thickness)
+    
+    return frame
+
+def create_side_by_side_video(before_video, after_video, add_labels=True):
+    """두 영상을 좌우로 붙여서 출력"""
+    if before_video is None or after_video is None:
+        return None, "전/후 영상을 모두 업로드해주세요"
+    
+    try:
+        cap_before = cv2.VideoCapture(before_video)
+        cap_after = cv2.VideoCapture(after_video)
+        
+        if not cap_before.isOpened() or not cap_after.isOpened():
+            return None, "영상을 열 수 없습니다"
+        
+        # 영상 정보 가져오기
+        fps_before = cap_before.get(cv2.CAP_PROP_FPS)
+        fps_after = cap_after.get(cv2.CAP_PROP_FPS)
+        fps = min(fps_before, fps_after, 30)  # 최대 30fps
+        
+        frame_count_before = int(cap_before.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_count_after = int(cap_after.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # 첫 프레임으로 크기 결정
+        ret_b, frame_b = cap_before.read()
+        ret_a, frame_a = cap_after.read()
+        
+        if not ret_b or not ret_a:
+            return None, "영상 프레임을 읽을 수 없습니다"
+        
+        # 리사이즈
+        frame_b = resize_video_frame(frame_b, VIDEO_MAX_SIZE)
+        frame_a = resize_video_frame(frame_a, VIDEO_MAX_SIZE)
+        
+        h_b, w_b = frame_b.shape[:2]
+        h_a, w_a = frame_a.shape[:2]
+        
+        # 높이 맞추기
+        target_h = max(h_b, h_a)
+        if h_b != target_h:
+            scale = target_h / h_b
+            w_b = int(w_b * scale)
+            frame_b = cv2.resize(frame_b, (w_b, target_h), interpolation=cv2.INTER_LANCZOS4)
+        if h_a != target_h:
+            scale = target_h / h_a
+            w_a = int(w_a * scale)
+            frame_a = cv2.resize(frame_a, (w_a, target_h), interpolation=cv2.INTER_LANCZOS4)
+        
+        # 구분선 너비
+        divider_width = 4
+        
+        # 최종 크기 (16의 배수로)
+        final_w = ((w_b + w_a + divider_width) // 16) * 16
+        final_h = (target_h // 16) * 16
+        
+        # 다시 계산
+        w_b_adj = (final_w - divider_width) // 2
+        w_a_adj = final_w - divider_width - w_b_adj
+        
+        cap_before.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        cap_after.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        # 출력 설정
+        temp_dir = tempfile.mkdtemp()
+        output_path = os.path.join(temp_dir, "side_by_side.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (final_w, final_h))
+        
+        # 프레임 동기화를 위한 계산
+        max_frames = max(frame_count_before, frame_count_after)
+        
+        frame_idx = 0
+        last_frame_b = None
+        last_frame_a = None
+        
+        while frame_idx < max_frames:
+            # Before 영상 프레임
+            if frame_idx < frame_count_before:
+                ret_b, frame_b = cap_before.read()
+                if ret_b:
+                    last_frame_b = frame_b.copy()
+            else:
+                frame_b = last_frame_b
+            
+            # After 영상 프레임
+            if frame_idx < frame_count_after:
+                ret_a, frame_a = cap_after.read()
+                if ret_a:
+                    last_frame_a = frame_a.copy()
+            else:
+                frame_a = last_frame_a
+            
+            if frame_b is None or frame_a is None:
+                break
+            
+            # 리사이즈
+            frame_b_resized = cv2.resize(frame_b, (w_b_adj, final_h), interpolation=cv2.INTER_LANCZOS4)
+            frame_a_resized = cv2.resize(frame_a, (w_a_adj, final_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            # 라벨 추가
+            if add_labels:
+                frame_b_resized = add_label(frame_b_resized, "BEFORE", 'top')
+                frame_a_resized = add_label(frame_a_resized, "AFTER", 'top')
+            
+            # 합치기
+            combined = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+            combined[:, :w_b_adj] = frame_b_resized
+            combined[:, w_b_adj:w_b_adj+divider_width] = [255, 255, 255]  # 흰색 구분선
+            combined[:, w_b_adj+divider_width:] = frame_a_resized
+            
+            out.write(combined)
+            frame_idx += 1
+        
+        cap_before.release()
+        cap_after.release()
+        out.release()
+        
+        duration = max_frames / fps
+        return output_path, f"{final_w}×{final_h} | {duration:.1f}초 | {max_frames}프레임"
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, f"오류: {str(e)}"
+
+
+# ============ UI ============
+
 custom_css = """
 .gradio-container { max-width: 900px !important; margin: auto !important; }
 footer { display: none !important; }
 """
 
-with gr.Blocks(title="Dental B&A") as demo:
+with gr.Blocks(title="Dental B&A", css=custom_css) as demo:
     gr.Markdown("<h1 style='text-align:center'>🦷 치과 전후 비교</h1>")
-    gr.Markdown("<p style='text-align:center;color:#666'>사진 업로드 → 자동 정렬 → MP4 생성</p>")
     
-    with gr.Row():
-        before_input = gr.Image(label="BEFORE", type="numpy")
-        after_input = gr.Image(label="AFTER", type="numpy")
-    
-    with gr.Accordion("로고 추가 (선택)", open=False):
-        logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
-    
-    generate_btn = gr.Button("영상 생성", variant="primary")
-    
-    with gr.Row():
-        video_output = gr.Video(label="결과")
-        status_output = gr.Textbox(label="정보", lines=3)
-    
-    generate_btn.click(
-        fn=create_video, 
-        inputs=[before_input, after_input, logo_input], 
-        outputs=[video_output, status_output]
-    )
+    with gr.Tabs():
+        # ===== 탭 1: 사진 비교 (기존) =====
+        with gr.TabItem("📷 사진 비교"):
+            gr.Markdown("<p style='text-align:center;color:#666'>사진 업로드 → 자동 정렬 → MP4 생성</p>")
+            
+            with gr.Row():
+                before_input = gr.Image(label="BEFORE", type="numpy")
+                after_input = gr.Image(label="AFTER", type="numpy")
+            
+            with gr.Accordion("로고 추가 (선택)", open=False):
+                logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
+            
+            generate_btn = gr.Button("영상 생성", variant="primary")
+            
+            with gr.Row():
+                video_output = gr.Video(label="결과")
+                status_output = gr.Textbox(label="정보", lines=3)
+            
+            generate_btn.click(
+                fn=create_video, 
+                inputs=[before_input, after_input, logo_input], 
+                outputs=[video_output, status_output]
+            )
+        
+        # ===== 탭 2: 영상 비교 (새로 추가) =====
+        with gr.TabItem("🎬 영상 비교"):
+            gr.Markdown("<p style='text-align:center;color:#666'>전/후 영상을 좌우로 붙여서 비교</p>")
+            
+            with gr.Row():
+                before_video_input = gr.Video(label="BEFORE 영상")
+                after_video_input = gr.Video(label="AFTER 영상")
+            
+            with gr.Row():
+                add_labels_checkbox = gr.Checkbox(label="BEFORE/AFTER 라벨 표시", value=True)
+            
+            generate_video_btn = gr.Button("영상 합치기", variant="primary")
+            
+            with gr.Row():
+                video_compare_output = gr.Video(label="결과")
+                video_status_output = gr.Textbox(label="정보", lines=3)
+            
+            generate_video_btn.click(
+                fn=create_side_by_side_video,
+                inputs=[before_video_input, after_video_input, add_labels_checkbox],
+                outputs=[video_compare_output, video_status_output]
+            )
 
-demo.launch(css=custom_css)
+demo.launch()
