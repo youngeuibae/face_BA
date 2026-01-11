@@ -82,7 +82,6 @@ def detect_face(img):
             lm = results.multi_face_landmarks[0].landmark
             h, w = img.shape[:2]
             
-            # 눈 좌표
             left_eye = np.mean([[lm[i].x*w, lm[i].y*h] for i in [33,133,160,159,158,144,145,153]], axis=0)
             right_eye = np.mean([[lm[i].x*w, lm[i].y*h] for i in [362,263,387,386,385,373,374,380]], axis=0)
             
@@ -90,7 +89,6 @@ def detect_face(img):
             eye_angle = np.arctan2(right_eye[1]-left_eye[1], right_eye[0]-left_eye[0])
             eye_center = (left_eye + right_eye) / 2
             
-            # 정중선 (코끝 ~ 턱)
             nose = np.array([lm[4].x*w, lm[4].y*h])
             chin = np.array([lm[152].x*w, lm[152].y*h])
             upper_lip = np.array([lm[0].x*w, lm[0].y*h])
@@ -100,7 +98,6 @@ def detect_face(img):
             midline_angle = np.arctan2(chin[1]-nose[1], chin[0]-nose[0])
             midline_center = (upper_lip + lower_lip) / 2
             
-            # 안모/반모 판별 (얼굴 종횡비)
             face_pts = [lm[i] for i in [10, 152, 234, 454]]
             xs = [p.x*w for p in face_pts]
             ys = [p.y*h for p in face_pts]
@@ -118,14 +115,13 @@ def detect_face(img):
         return None
 
 def detect_oral(img):
-    """구강(치아) 감지 - Otsu 기반"""
+    """구강(치아) 감지 - 무게중심으로 정중선(11-21 사이) 찾기"""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
     
     blurred = cv2.GaussianBlur(gray, (5,5), 0)
     _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # 중앙 영역만
     roi = np.zeros_like(mask)
     m = 0.12
     roi[int(h*m):int(h*(1-m)), int(w*m):int(w*(1-m))] = 255
@@ -135,7 +131,7 @@ def detect_oral(img):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     
-    # 상하악 경계 찾기
+    # 상하악 경계 (교합면)
     row_sum = np.convolve(np.sum(mask>0, axis=1), np.ones(11)/11, mode='same')
     search = row_sum[int(h*0.35):int(h*0.65)]
     occlusal_y = int(h*0.35) + np.argmin(search) if len(search) > 0 else h//2
@@ -156,11 +152,21 @@ def detect_oral(img):
         return None
     
     x, y, bw, bh = cv2.boundingRect(largest)
-    M = cv2.moments(largest)
-    cx = M['m10']/M['m00'] if M['m00'] else x+bw/2
-    cy = M['m01']/M['m00'] if M['m00'] else y+bh/2
     
-    return {'type': 'oral', 'cx': cx, 'cy': cy, 'width': bw, 'height': bh}
+    # 무게중심으로 정중선 X 좌표 (11-21 사이)
+    M = cv2.moments(largest)
+    if M['m00'] > 0:
+        cx = M['m10'] / M['m00']
+    else:
+        cx = x + bw / 2
+    
+    return {
+        'type': 'oral',
+        'cx': cx,
+        'cy': occlusal_y,
+        'width': bw,
+        'height': bh
+    }
 
 def detect_features(img):
     """통합 감지: 얼굴 → 구강 → 폴백"""
@@ -177,9 +183,9 @@ def detect_features(img):
 
 # ===== 정렬 =====
 def align_balanced(before, after, bi, ai):
-    """균형 스케일링: 두 이미지를 중간 크기로 정렬"""
+    """균형 스케일링: 두 이미지를 중간 크기로, 치아 중앙을 이미지 중앙으로"""
     h, w = before.shape[:2]
-    target = np.array([w/2, h/2])
+    target = np.array([w/2, h/2])  # 이미지 중앙
     
     b_type, a_type = bi['type'], ai['type']
     
@@ -215,38 +221,24 @@ def align_balanced(before, after, bi, ai):
         a_anchor = ai['midline_center']
         align_type = "반모"
     
-    # 구강 (Oral)
-    elif b_type == 'oral' and a_type == 'oral':
-        ratio = ai['width'] / bi['width']
+    # 구강 (Oral) - 치아 중앙을 이미지 중앙으로
+    elif b_type == 'oral' or a_type == 'oral':
+        b_w = bi.get('width', w*0.5)
+        a_w = ai.get('width', w*0.5)
+        ratio = a_w / b_w
         ratio = np.clip(ratio, 0.5, 2.0)
         mid_scale = np.sqrt(ratio)
         b_scale = np.clip(mid_scale, 0.7, 1.4)
         a_scale = np.clip(1/mid_scale, 0.7, 1.4)
         
+        b_anchor = np.array([bi.get('cx', w/2), bi.get('cy', h/2)])
+        a_anchor = np.array([ai.get('cx', w/2), ai.get('cy', h/2)])
         b_angle, a_angle = 0, 0
-        b_anchor = np.array([bi['cx'], bi['cy']])
-        a_anchor = np.array([ai['cx'], ai['cy']])
         align_type = "구강"
     
-    # 혼합 또는 폴백
+    # 폴백
     else:
-        # 둘 중 하나라도 oral이면 oral 방식
-        if b_type == 'oral' or a_type == 'oral':
-            b_w = bi.get('width', w*0.5)
-            a_w = ai.get('width', w*0.5)
-            ratio = a_w / b_w
-            ratio = np.clip(ratio, 0.5, 2.0)
-            mid_scale = np.sqrt(ratio)
-            b_scale = np.clip(mid_scale, 0.7, 1.4)
-            a_scale = np.clip(1/mid_scale, 0.7, 1.4)
-            
-            b_anchor = np.array([bi.get('cx', w/2), bi.get('cy', h/2)])
-            a_anchor = np.array([ai.get('cx', w/2), ai.get('cy', h/2)])
-            b_angle, a_angle = 0, 0
-            align_type = "구강(혼합)"
-        else:
-            # 폴백: 변환 없음
-            return before.copy(), after.copy(), "미감지"
+        return before.copy(), after.copy(), "미감지"
     
     # 변환 적용
     def transform(img, anchor, angle, scale, target):
@@ -300,7 +292,7 @@ def process_images(before_img, after_img, logo_img=None):
 
 # ===== 출력 생성 =====
 def create_dissolve(before_img, after_img, logo_img=None):
-    """디졸브 영상 생성"""
+    """디졸브 영상"""
     if before_img is None or after_img is None:
         return None, "전/후 사진을 모두 업로드해주세요"
     
@@ -308,7 +300,7 @@ def create_dissolve(before_img, after_img, logo_img=None):
         bf, af, logo, align_type, fw, fh = process_images(before_img, after_img, logo_img)
         
         fps = 30
-        frames = [39, 12, 39]  # before, dissolve, after
+        frames = [39, 12, 39]
         
         temp = tempfile.mkdtemp()
         path = os.path.join(temp, "dissolve.mp4")
@@ -332,7 +324,7 @@ def create_dissolve(before_img, after_img, logo_img=None):
         return None, f"오류: {e}"
 
 def create_sidebyside(before_img, after_img, logo_img=None):
-    """좌우 비교 이미지"""
+    """좌우 비교"""
     if before_img is None or after_img is None:
         return None, "전/후 사진을 모두 업로드해주세요"
     
@@ -354,15 +346,14 @@ def create_sidebyside(before_img, after_img, logo_img=None):
 
 # ===== 배치 처리 =====
 def process_batch(files, output_type, logo_img=None):
-    """배치 처리: 여러 쌍의 B/A 처리"""
+    """배치 처리"""
     if not files or len(files) < 2:
-        return None, "최소 2개 파일(before/after 쌍)이 필요합니다"
+        return None, "최소 2개 파일 필요 (before/after 쌍)"
     
-    # 파일 정렬 (이름순)
     files = sorted(files, key=lambda x: x.name if hasattr(x, 'name') else x)
     
     if len(files) % 2 != 0:
-        return None, "파일 개수가 짝수여야 합니다 (before/after 쌍)"
+        return None, "파일 개수가 짝수여야 합니다"
     
     temp = tempfile.mkdtemp()
     results = []
@@ -374,50 +365,48 @@ def process_batch(files, output_type, logo_img=None):
         before_img = cv2.cvtColor(cv2.imread(before_path), cv2.COLOR_BGR2RGB)
         after_img = cv2.cvtColor(cv2.imread(after_path), cv2.COLOR_BGR2RGB)
         
-        pair_idx = i // 2 + 1
+        idx = i // 2 + 1
         
         if output_type == "디졸브":
-            result, status = create_dissolve(before_img, after_img, logo_img)
+            result, _ = create_dissolve(before_img, after_img, logo_img)
             if result:
-                new_path = os.path.join(temp, f"dissolve_{pair_idx:03d}.mp4")
+                new_path = os.path.join(temp, f"dissolve_{idx:03d}.mp4")
                 os.rename(result, new_path)
                 results.append(new_path)
         else:
-            result, status = create_sidebyside(before_img, after_img, logo_img)
+            result, _ = create_sidebyside(before_img, after_img, logo_img)
             if result is not None:
-                new_path = os.path.join(temp, f"sidebyside_{pair_idx:03d}.png")
+                new_path = os.path.join(temp, f"sidebyside_{idx:03d}.png")
                 cv2.imwrite(new_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
                 results.append(new_path)
     
     if not results:
-        return None, "처리된 결과가 없습니다"
+        return None, "처리 실패"
     
-    # ZIP으로 묶기
     zip_path = os.path.join(temp, "batch_results.zip")
     with zipfile.ZipFile(zip_path, 'w') as zf:
         for r in results:
             zf.write(r, os.path.basename(r))
     
-    return zip_path, f"{len(results)}개 처리 완료"
+    return zip_path, f"{len(results)}개 완료"
 
 # ===== UI =====
 with gr.Blocks(title="Dental B&A", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🦷 치과 전후 비교")
-    gr.Markdown("안모/반모/구강 자동 감지 → 균형 스케일 정렬")
+    gr.Markdown("안모/반모/구강 자동 감지 → 균형 스케일 + 중앙 정렬")
     
     with gr.Tabs():
-        # 단일 처리 탭
         with gr.Tab("단일 처리"):
             with gr.Row():
                 before_input = gr.Image(label="BEFORE", type="numpy")
                 after_input = gr.Image(label="AFTER", type="numpy")
             
             with gr.Accordion("로고 (선택)", open=False):
-                logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
+                logo_input = gr.Image(label="PNG 투명 배경", type="numpy")
             
             with gr.Row():
-                dissolve_btn = gr.Button("🎬 디졸브 영상", variant="primary")
-                sidebyside_btn = gr.Button("🖼️ 좌우 비교")
+                dissolve_btn = gr.Button("🎬 디졸브", variant="primary")
+                sidebyside_btn = gr.Button("🖼️ 좌우비교")
             
             with gr.Row():
                 video_out = gr.Video(label="영상")
@@ -428,16 +417,15 @@ with gr.Blocks(title="Dental B&A", theme=gr.themes.Soft()) as demo:
             dissolve_btn.click(create_dissolve, [before_input, after_input, logo_input], [video_out, status_out])
             sidebyside_btn.click(create_sidebyside, [before_input, after_input, logo_input], [image_out, status_out])
         
-        # 배치 처리 탭
         with gr.Tab("배치 처리"):
-            gr.Markdown("파일명 순서대로 before/after 쌍으로 처리됩니다.\n\n예: `01_before.jpg, 01_after.jpg, 02_before.jpg, 02_after.jpg`")
+            gr.Markdown("파일명 순서대로 before/after 쌍으로 처리\n\n예: `01_B.jpg, 01_A.jpg, 02_B.jpg, 02_A.jpg`")
             
-            batch_files = gr.File(label="이미지 파일들", file_count="multiple", file_types=["image"])
-            batch_type = gr.Radio(["디졸브", "좌우비교"], value="디졸브", label="출력 형식")
-            batch_logo = gr.Image(label="로고 (선택)", type="numpy")
+            batch_files = gr.File(label="이미지들", file_count="multiple", file_types=["image"])
+            batch_type = gr.Radio(["디졸브", "좌우비교"], value="디졸브", label="출력")
+            batch_logo = gr.Image(label="로고", type="numpy")
             
-            batch_btn = gr.Button("배치 처리 시작", variant="primary")
-            batch_out = gr.File(label="결과 (ZIP)")
+            batch_btn = gr.Button("배치 시작", variant="primary")
+            batch_out = gr.File(label="결과 ZIP")
             batch_status = gr.Textbox(label="상태")
             
             batch_btn.click(process_batch, [batch_files, batch_type, batch_logo], [batch_out, batch_status])
