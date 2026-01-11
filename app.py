@@ -3,127 +3,33 @@ import cv2
 import numpy as np
 import tempfile
 import os
+import zipfile
 
 MAX_SIZE = 1920
 
+# ===== 유틸리티 =====
 def resize_if_needed(img):
     h, w = img.shape[:2]
     if max(h, w) > MAX_SIZE:
-        if w > h:
-            new_w = MAX_SIZE
-            new_h = int(h * MAX_SIZE / w)
-        else:
-            new_h = MAX_SIZE
-            new_w = int(w * MAX_SIZE / h)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        scale = MAX_SIZE / max(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
     return img
 
 def resize_and_crop_to_match(img1, img2):
     h1, w1 = img1.shape[:2]
     h2, w2 = img2.shape[:2]
-    ratio1 = w1 / h1
-    ratio2 = w2 / h2
+    ratio1, ratio2 = w1/h1, w2/h2
     
     if ratio1 > ratio2:
-        new_h = h2
         new_w = int(h2 * ratio1)
+        new_h = h2
     else:
         new_w = w2
         new_h = int(w2 / ratio1)
     
     img1_resized = cv2.resize(img1, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-    start_x = (new_w - w2) // 2
-    start_y = (new_h - h2) // 2
-    return img1_resized[start_y:start_y+h2, start_x:start_x+w2]
-
-def get_oral_teeth_info(img):
-    """구강 사진 치아 정보 (Otsu 기반)"""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h_img, w_img = img.shape[:2]
-    
-    blurred = cv2.GaussianBlur(gray, (5,5), 0)
-    _, otsu_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    margin = 0.12
-    roi = np.zeros_like(otsu_mask)
-    roi[int(h_img*margin):int(h_img*(1-margin)), 
-        int(w_img*margin):int(w_img*(1-margin))] = 255
-    teeth_mask = cv2.bitwise_and(otsu_mask, roi)
-    
-    kernel = np.ones((5,5), np.uint8)
-    teeth_mask = cv2.morphologyEx(teeth_mask, cv2.MORPH_CLOSE, kernel)
-    teeth_mask = cv2.morphologyEx(teeth_mask, cv2.MORPH_OPEN, kernel)
-    
-    row_sum = np.sum(teeth_mask > 0, axis=1)
-    row_smooth = np.convolve(row_sum, np.ones(11)/11, mode='same')
-    
-    search_start = int(h_img * 0.35)
-    search_end = int(h_img * 0.65)
-    search_region = row_smooth[search_start:search_end]
-    
-    occlusal_y = search_start + np.argmin(search_region) if len(search_region) > 0 else h_img // 2
-    
-    upper_mask = teeth_mask.copy()
-    upper_mask[int(occlusal_y):, :] = 0
-    
-    contours, _ = cv2.findContours(upper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        contours, _ = cv2.findContours(teeth_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return None
-    
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < (w_img * h_img) * 0.01:
-        return None
-    
-    x, y, bw, bh = cv2.boundingRect(largest)
-    M = cv2.moments(largest)
-    cx = M['m10'] / M['m00'] if M['m00'] > 0 else x + bw/2
-    cy = M['m01'] / M['m00'] if M['m00'] > 0 else y + bh/2
-    
-    return {'cx': float(cx), 'cy': float(cy), 'bw': float(bw), 'bh': float(bh), 'detected': True, 'type': 'oral'}
-
-def get_face_info(img):
-    """얼굴 또는 구강 감지"""
-    try:
-        import mediapipe as mp
-        mp_face_mesh = mp.solutions.face_mesh
-        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1,
-                                    min_detection_confidence=0.1) as face_mesh:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb)
-            if results.multi_face_landmarks:
-                lm = results.multi_face_landmarks[0].landmark
-                h, w = img.shape[:2]
-                
-                left_eye_idx = [33, 133, 160, 159, 158, 144, 145, 153]
-                right_eye_idx = [362, 263, 387, 386, 385, 373, 374, 380]
-                
-                left_eye_x = np.mean([lm[i].x for i in left_eye_idx]) * w
-                left_eye_y = np.mean([lm[i].y for i in left_eye_idx]) * h
-                right_eye_x = np.mean([lm[i].x for i in right_eye_idx]) * w
-                right_eye_y = np.mean([lm[i].y for i in right_eye_idx]) * h
-                
-                eye_dist = np.sqrt((right_eye_x - left_eye_x)**2 + (right_eye_y - left_eye_y)**2)
-                eye_angle = np.arctan2(right_eye_y - left_eye_y, right_eye_x - left_eye_x)
-                eyes_cx = (left_eye_x + right_eye_x) / 2
-                eyes_cy = (left_eye_y + right_eye_y) / 2
-                
-                return {
-                    'cx': eyes_cx, 'cy': eyes_cy,
-                    'eye_dist': eye_dist, 'eye_angle': eye_angle,
-                    'detected': True, 'type': 'face'
-                }
-    except:
-        pass
-    
-    oral = get_oral_teeth_info(img)
-    if oral:
-        return oral
-    
-    h, w = img.shape[:2]
-    return {'cx': w/2, 'cy': h/2, 'bw': w*0.6, 'detected': False, 'type': 'fallback'}
+    sx, sy = (new_w - w2) // 2, (new_h - h2) // 2
+    return img1_resized[sy:sy+h2, sx:sx+w2]
 
 def match_brightness(img1, img2):
     lab1 = cv2.cvtColor(img1, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -142,11 +48,10 @@ def add_logo(frame, logo, margin_ratio=0.03, width_ratio=0.27):
     logo_resized = cv2.resize(logo, (logo_w, logo_h), interpolation=cv2.INTER_LANCZOS4)
     margin = int(w * margin_ratio)
     
-    if len(logo_resized.shape) == 3 and logo_resized.shape[2] == 4:
+    if logo_resized.shape[2] == 4:
         alpha = logo_resized[:, :, 3:4] / 255.0
-        logo_bgr = logo_resized[:, :, :3]
         roi = frame[margin:margin+logo_h, margin:margin+logo_w]
-        frame[margin:margin+logo_h, margin:margin+logo_w] = (logo_bgr * alpha + roi * (1 - alpha)).astype(np.uint8)
+        frame[margin:margin+logo_h, margin:margin+logo_w] = (logo_resized[:,:,:3] * alpha + roi * (1-alpha)).astype(np.uint8)
     else:
         frame[margin:margin+logo_h, margin:margin+logo_w] = logo_resized
     return frame
@@ -157,84 +62,206 @@ def add_label(img, text, position='top'):
     scale = max(0.7, min(w, h) / 900)
     thickness = max(2, int(scale * 2))
     (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
-    
     pad = 8
     bx = (w - tw - pad*2) // 2
     by = 12 if position == 'top' else h - th - pad*2 - 12
-    
     cv2.rectangle(img, (bx, by), (bx + tw + pad*2, by + th + pad*2), (0,0,0), -1)
     cv2.putText(img, text, (bx + pad, by + th + pad), font, scale, (255,255,255), thickness)
     return img
 
+# ===== 감지 =====
+def detect_face(img):
+    """MediaPipe 얼굴 감지 → 안모/반모 판별"""
+    try:
+        import mediapipe as mp
+        with mp.solutions.face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, min_detection_confidence=0.3) as fm:
+            results = fm.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            if not results.multi_face_landmarks:
+                return None
+            
+            lm = results.multi_face_landmarks[0].landmark
+            h, w = img.shape[:2]
+            
+            # 눈 좌표
+            left_eye = np.mean([[lm[i].x*w, lm[i].y*h] for i in [33,133,160,159,158,144,145,153]], axis=0)
+            right_eye = np.mean([[lm[i].x*w, lm[i].y*h] for i in [362,263,387,386,385,373,374,380]], axis=0)
+            
+            eye_dist = np.linalg.norm(right_eye - left_eye)
+            eye_angle = np.arctan2(right_eye[1]-left_eye[1], right_eye[0]-left_eye[0])
+            eye_center = (left_eye + right_eye) / 2
+            
+            # 정중선 (코끝 ~ 턱)
+            nose = np.array([lm[4].x*w, lm[4].y*h])
+            chin = np.array([lm[152].x*w, lm[152].y*h])
+            upper_lip = np.array([lm[0].x*w, lm[0].y*h])
+            lower_lip = np.array([lm[17].x*w, lm[17].y*h])
+            
+            midline_len = np.linalg.norm(chin - nose)
+            midline_angle = np.arctan2(chin[1]-nose[1], chin[0]-nose[0])
+            midline_center = (upper_lip + lower_lip) / 2
+            
+            # 안모/반모 판별 (얼굴 종횡비)
+            face_pts = [lm[i] for i in [10, 152, 234, 454]]
+            xs = [p.x*w for p in face_pts]
+            ys = [p.y*h for p in face_pts]
+            aspect = (max(ys)-min(ys)) / (max(xs)-min(xs)) if max(xs)!=min(xs) else 1
+            
+            is_half = aspect < 0.9
+            
+            return {
+                'type': 'half_face' if is_half else 'full_face',
+                'eye_dist': eye_dist, 'eye_angle': eye_angle, 'eye_center': eye_center,
+                'midline_len': midline_len, 'midline_angle': midline_angle, 'midline_center': midline_center
+            }
+    except Exception as e:
+        print(f"Face detection error: {e}")
+        return None
+
+def detect_oral(img):
+    """구강(치아) 감지 - Otsu 기반"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+    
+    blurred = cv2.GaussianBlur(gray, (5,5), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 중앙 영역만
+    roi = np.zeros_like(mask)
+    m = 0.12
+    roi[int(h*m):int(h*(1-m)), int(w*m):int(w*(1-m))] = 255
+    mask = cv2.bitwise_and(mask, roi)
+    
+    kernel = np.ones((5,5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    # 상하악 경계 찾기
+    row_sum = np.convolve(np.sum(mask>0, axis=1), np.ones(11)/11, mode='same')
+    search = row_sum[int(h*0.35):int(h*0.65)]
+    occlusal_y = int(h*0.35) + np.argmin(search) if len(search) > 0 else h//2
+    
+    # 상악 영역
+    upper = mask.copy()
+    upper[occlusal_y:, :] = 0
+    
+    contours, _ = cv2.findContours(upper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None
+    
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < w*h*0.01:
+        return None
+    
+    x, y, bw, bh = cv2.boundingRect(largest)
+    M = cv2.moments(largest)
+    cx = M['m10']/M['m00'] if M['m00'] else x+bw/2
+    cy = M['m01']/M['m00'] if M['m00'] else y+bh/2
+    
+    return {'type': 'oral', 'cx': cx, 'cy': cy, 'width': bw, 'height': bh}
+
+def detect_features(img):
+    """통합 감지: 얼굴 → 구강 → 폴백"""
+    face = detect_face(img)
+    if face:
+        return face
+    
+    oral = detect_oral(img)
+    if oral:
+        return oral
+    
+    h, w = img.shape[:2]
+    return {'type': 'fallback', 'cx': w/2, 'cy': h/2, 'width': w*0.5}
+
+# ===== 정렬 =====
 def align_balanced(before, after, bi, ai):
-    """균형 스케일링: 두 이미지를 중간 크기로"""
-    h_img, w_img = before.shape[:2]
-    target_cx, target_cy = w_img / 2, h_img / 2
+    """균형 스케일링: 두 이미지를 중간 크기로 정렬"""
+    h, w = before.shape[:2]
+    target = np.array([w/2, h/2])
     
-    # 구강 사진
-    if bi.get('type') == 'oral' and ai.get('type') == 'oral':
-        ratio = ai['bw'] / bi['bw']
-        ratio = np.clip(ratio, 0.5, 2.0)
-        
-        mid_scale = np.sqrt(ratio)
-        b_scale = np.clip(mid_scale, 0.7, 1.4)
-        a_scale = np.clip(1.0 / mid_scale, 0.7, 1.4)
-        
-        # Before 변환
-        M_b = cv2.getRotationMatrix2D((bi['cx'], bi['cy']), 0, b_scale)
-        new_bx = M_b[0,0]*bi['cx'] + M_b[0,1]*bi['cy'] + M_b[0,2]
-        new_by = M_b[1,0]*bi['cx'] + M_b[1,1]*bi['cy'] + M_b[1,2]
-        M_b[0,2] += target_cx - new_bx
-        M_b[1,2] += target_cy - new_by
-        
-        # After 변환
-        M_a = cv2.getRotationMatrix2D((ai['cx'], ai['cy']), 0, a_scale)
-        new_ax = M_a[0,0]*ai['cx'] + M_a[0,1]*ai['cy'] + M_a[0,2]
-        new_ay = M_a[1,0]*ai['cx'] + M_a[1,1]*ai['cy'] + M_a[1,2]
-        M_a[0,2] += target_cx - new_ax
-        M_a[1,2] += target_cy - new_ay
-        
-        before_out = cv2.warpAffine(before, M_b, (w_img, h_img), borderMode=cv2.BORDER_REPLICATE)
-        after_out = cv2.warpAffine(after, M_a, (w_img, h_img), borderMode=cv2.BORDER_REPLICATE)
-        
-        return before_out, after_out, f"구강(균형 {b_scale:.2f}/{a_scale:.2f})"
+    b_type, a_type = bi['type'], ai['type']
     
-    # 얼굴 사진
-    if bi.get('type') == 'face' and ai.get('type') == 'face':
+    # 안모 (Full Face)
+    if b_type == 'full_face' and a_type == 'full_face':
         ratio = ai['eye_dist'] / bi['eye_dist']
         ratio = np.clip(ratio, 0.5, 2.0)
-        
         mid_scale = np.sqrt(ratio)
         b_scale = np.clip(mid_scale, 0.8, 1.25)
-        a_scale = np.clip(1.0 / mid_scale, 0.8, 1.25)
+        a_scale = np.clip(1/mid_scale, 0.8, 1.25)
         
-        # 각도 차이
         angle_diff = ai['eye_angle'] - bi['eye_angle']
-        b_angle = np.degrees(angle_diff / 2)
-        a_angle = -np.degrees(angle_diff / 2)
-        b_angle = np.clip(b_angle, -10, 10)
-        a_angle = np.clip(a_angle, -10, 10)
+        b_angle = np.degrees(angle_diff/2)
+        a_angle = -np.degrees(angle_diff/2)
         
-        M_b = cv2.getRotationMatrix2D((bi['cx'], bi['cy']), b_angle, b_scale)
-        new_bx = M_b[0,0]*bi['cx'] + M_b[0,1]*bi['cy'] + M_b[0,2]
-        new_by = M_b[1,0]*bi['cx'] + M_b[1,1]*bi['cy'] + M_b[1,2]
-        M_b[0,2] += target_cx - new_bx
-        M_b[1,2] += target_cy - new_by
-        
-        M_a = cv2.getRotationMatrix2D((ai['cx'], ai['cy']), a_angle, a_scale)
-        new_ax = M_a[0,0]*ai['cx'] + M_a[0,1]*ai['cy'] + M_a[0,2]
-        new_ay = M_a[1,0]*ai['cx'] + M_a[1,1]*ai['cy'] + M_a[1,2]
-        M_a[0,2] += target_cx - new_ax
-        M_a[1,2] += target_cy - new_ay
-        
-        before_out = cv2.warpAffine(before, M_b, (w_img, h_img), borderMode=cv2.BORDER_REPLICATE)
-        after_out = cv2.warpAffine(after, M_a, (w_img, h_img), borderMode=cv2.BORDER_REPLICATE)
-        
-        return before_out, after_out, f"안모(균형 {b_scale:.2f}/{a_scale:.2f})"
+        b_anchor = bi['eye_center']
+        a_anchor = ai['eye_center']
+        align_type = "안모"
     
-    # 폴백: 변환 없음
-    return before.copy(), after.copy(), "미감지"
+    # 반모 (Half Face)
+    elif b_type == 'half_face' and a_type == 'half_face':
+        ratio = ai['midline_len'] / bi['midline_len']
+        ratio = np.clip(ratio, 0.5, 2.0)
+        mid_scale = np.sqrt(ratio)
+        b_scale = np.clip(mid_scale, 0.8, 1.25)
+        a_scale = np.clip(1/mid_scale, 0.8, 1.25)
+        
+        angle_diff = ai['midline_angle'] - bi['midline_angle']
+        b_angle = np.degrees(angle_diff/2)
+        a_angle = -np.degrees(angle_diff/2)
+        
+        b_anchor = bi['midline_center']
+        a_anchor = ai['midline_center']
+        align_type = "반모"
+    
+    # 구강 (Oral)
+    elif b_type == 'oral' and a_type == 'oral':
+        ratio = ai['width'] / bi['width']
+        ratio = np.clip(ratio, 0.5, 2.0)
+        mid_scale = np.sqrt(ratio)
+        b_scale = np.clip(mid_scale, 0.7, 1.4)
+        a_scale = np.clip(1/mid_scale, 0.7, 1.4)
+        
+        b_angle, a_angle = 0, 0
+        b_anchor = np.array([bi['cx'], bi['cy']])
+        a_anchor = np.array([ai['cx'], ai['cy']])
+        align_type = "구강"
+    
+    # 혼합 또는 폴백
+    else:
+        # 둘 중 하나라도 oral이면 oral 방식
+        if b_type == 'oral' or a_type == 'oral':
+            b_w = bi.get('width', w*0.5)
+            a_w = ai.get('width', w*0.5)
+            ratio = a_w / b_w
+            ratio = np.clip(ratio, 0.5, 2.0)
+            mid_scale = np.sqrt(ratio)
+            b_scale = np.clip(mid_scale, 0.7, 1.4)
+            a_scale = np.clip(1/mid_scale, 0.7, 1.4)
+            
+            b_anchor = np.array([bi.get('cx', w/2), bi.get('cy', h/2)])
+            a_anchor = np.array([ai.get('cx', w/2), ai.get('cy', h/2)])
+            b_angle, a_angle = 0, 0
+            align_type = "구강(혼합)"
+        else:
+            # 폴백: 변환 없음
+            return before.copy(), after.copy(), "미감지"
+    
+    # 변환 적용
+    def transform(img, anchor, angle, scale, target):
+        M = cv2.getRotationMatrix2D(tuple(anchor), angle, scale)
+        new_anchor = M @ np.array([anchor[0], anchor[1], 1])
+        M[0,2] += target[0] - new_anchor[0]
+        M[1,2] += target[1] - new_anchor[1]
+        return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]), borderMode=cv2.BORDER_REPLICATE)
+    
+    before_out = transform(before, b_anchor, b_angle, b_scale, target)
+    after_out = transform(after, a_anchor, a_angle, a_scale, target)
+    
+    return before_out, after_out, f"{align_type}({b_scale:.2f}/{a_scale:.2f})"
 
+# ===== 처리 =====
 def process_images(before_img, after_img, logo_img=None):
     """이미지 전처리 및 정렬"""
     before = cv2.cvtColor(before_img, cv2.COLOR_RGB2BGR)
@@ -248,68 +275,61 @@ def process_images(before_img, after_img, logo_img=None):
     
     logo = None
     if logo_img is not None:
-        if len(logo_img.shape) == 3 and logo_img.shape[2] == 4:
-            logo = cv2.cvtColor(logo_img, cv2.COLOR_RGBA2BGRA)
-        else:
-            logo = cv2.cvtColor(logo_img, cv2.COLOR_RGB2BGR)
+        logo = cv2.cvtColor(logo_img, cv2.COLOR_RGBA2BGRA if logo_img.shape[2]==4 else cv2.COLOR_RGB2BGR)
     
-    bi = get_face_info(before)
-    ai = get_face_info(after)
+    bi = detect_features(before)
+    ai = detect_features(after)
     
     before_aligned, after_aligned, align_type = align_balanced(before, after, bi, ai)
     
-    # 크롭 및 밝기 보정
+    # 크롭
     h, w = after_aligned.shape[:2]
-    margin = 0.05
-    cx1, cy1 = int(w * margin), int(h * margin)
-    cx2, cy2 = int(w * (1 - margin)), int(h * (1 - margin))
-    
-    bf = before_aligned[cy1:cy2, cx1:cx2]
-    af = after_aligned[cy1:cy2, cx1:cx2]
+    m = 0.05
+    bf = before_aligned[int(h*m):int(h*(1-m)), int(w*m):int(w*(1-m))]
+    af = after_aligned[int(h*m):int(h*(1-m)), int(w*m):int(w*(1-m))]
     
     bf, af = match_brightness(bf, af)
     
-    # 16배수 맞춤
+    # 16배수
     th, tw = af.shape[:2]
-    fw, fh = (tw // 16) * 16, (th // 16) * 16
+    fw, fh = (tw//16)*16, (th//16)*16
     bf = cv2.resize(bf, (fw, fh), interpolation=cv2.INTER_LANCZOS4)
     af = cv2.resize(af, (fw, fh), interpolation=cv2.INTER_LANCZOS4)
     
-    return bf, af, logo, bi, ai, align_type, fw, fh
+    return bf, af, logo, align_type, fw, fh
 
-def create_dissolve_video(before_img, after_img, logo_img=None):
-    """디졸브 영상"""
+# ===== 출력 생성 =====
+def create_dissolve(before_img, after_img, logo_img=None):
+    """디졸브 영상 생성"""
     if before_img is None or after_img is None:
         return None, "전/후 사진을 모두 업로드해주세요"
     
     try:
-        bf, af, logo, bi, ai, align_type, fw, fh = process_images(before_img, after_img, logo_img)
+        bf, af, logo, align_type, fw, fh = process_images(before_img, after_img, logo_img)
         
         fps = 30
-        before_frames, dissolve_frames, after_frames = 39, 12, 39
+        frames = [39, 12, 39]  # before, dissolve, after
         
-        temp_dir = tempfile.mkdtemp()
-        output_path = os.path.join(temp_dir, "dissolve.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
+        temp = tempfile.mkdtemp()
+        path = os.path.join(temp, "dissolve.mp4")
+        out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (fw, fh))
         
-        for i in range(before_frames + dissolve_frames + after_frames):
-            if i < before_frames:
+        for i in range(sum(frames)):
+            if i < frames[0]:
                 frame = bf.copy()
-            elif i < before_frames + dissolve_frames:
-                alpha = (i - before_frames) / dissolve_frames
+            elif i < frames[0] + frames[1]:
+                alpha = (i - frames[0]) / frames[1]
                 frame = cv2.addWeighted(bf, 1-alpha, af, alpha, 0)
             else:
                 frame = af.copy()
-            if logo:
+            if logo is not None:
                 frame = add_logo(frame, logo)
             out.write(frame)
         
         out.release()
-        
-        return output_path, f"{fw}×{fh} | 3.0초 | {align_type}"
+        return path, f"{fw}×{fh} | 3.0초 | {align_type}"
     except Exception as e:
-        return None, f"오류: {str(e)}"
+        return None, f"오류: {e}"
 
 def create_sidebyside(before_img, after_img, logo_img=None):
     """좌우 비교 이미지"""
@@ -317,44 +337,109 @@ def create_sidebyside(before_img, after_img, logo_img=None):
         return None, "전/후 사진을 모두 업로드해주세요"
     
     try:
-        bf, af, logo, bi, ai, align_type, fw, fh = process_images(before_img, after_img, logo_img)
+        bf, af, logo, align_type, fw, fh = process_images(before_img, after_img, logo_img)
         
-        bf_labeled = add_label(bf.copy(), "BEFORE")
-        af_labeled = add_label(af.copy(), "AFTER")
+        bf_l = add_label(bf.copy(), "BEFORE")
+        af_l = add_label(af.copy(), "AFTER")
         
         divider = np.ones((fh, 4, 3), dtype=np.uint8) * 255
-        combined = np.hstack([bf_labeled, divider, af_labeled])
+        combined = np.hstack([bf_l, divider, af_l])
         
-        if logo:
+        if logo is not None:
             combined = add_logo(combined, logo, width_ratio=0.15)
         
-        combined_rgb = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
-        return combined_rgb, f"{combined.shape[1]}×{combined.shape[0]} | {align_type}"
+        return cv2.cvtColor(combined, cv2.COLOR_BGR2RGB), f"{combined.shape[1]}×{combined.shape[0]} | {align_type}"
     except Exception as e:
-        return None, f"오류: {str(e)}"
+        return None, f"오류: {e}"
 
-with gr.Blocks(title="Dental B&A") as demo:
-    gr.Markdown("<h1 style='text-align:center'>🦷 치과 전후 비교</h1>")
-    gr.Markdown("<p style='text-align:center;color:#666'>얼굴/구강 자동 감지 → 균형 스케일 정렬</p>")
+# ===== 배치 처리 =====
+def process_batch(files, output_type, logo_img=None):
+    """배치 처리: 여러 쌍의 B/A 처리"""
+    if not files or len(files) < 2:
+        return None, "최소 2개 파일(before/after 쌍)이 필요합니다"
     
-    with gr.Row():
-        before_input = gr.Image(label="BEFORE", type="numpy")
-        after_input = gr.Image(label="AFTER", type="numpy")
+    # 파일 정렬 (이름순)
+    files = sorted(files, key=lambda x: x.name if hasattr(x, 'name') else x)
     
-    with gr.Accordion("로고 (선택)", open=False):
-        logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
+    if len(files) % 2 != 0:
+        return None, "파일 개수가 짝수여야 합니다 (before/after 쌍)"
     
-    with gr.Row():
-        dissolve_btn = gr.Button("🎬 디졸브 영상", variant="primary")
-        sidebyside_btn = gr.Button("🖼️ 좌우 비교")
+    temp = tempfile.mkdtemp()
+    results = []
     
-    with gr.Row():
-        video_output = gr.Video(label="영상")
-        image_output = gr.Image(label="이미지")
+    for i in range(0, len(files), 2):
+        before_path = files[i].name if hasattr(files[i], 'name') else files[i]
+        after_path = files[i+1].name if hasattr(files[i+1], 'name') else files[i+1]
+        
+        before_img = cv2.cvtColor(cv2.imread(before_path), cv2.COLOR_BGR2RGB)
+        after_img = cv2.cvtColor(cv2.imread(after_path), cv2.COLOR_BGR2RGB)
+        
+        pair_idx = i // 2 + 1
+        
+        if output_type == "디졸브":
+            result, status = create_dissolve(before_img, after_img, logo_img)
+            if result:
+                new_path = os.path.join(temp, f"dissolve_{pair_idx:03d}.mp4")
+                os.rename(result, new_path)
+                results.append(new_path)
+        else:
+            result, status = create_sidebyside(before_img, after_img, logo_img)
+            if result is not None:
+                new_path = os.path.join(temp, f"sidebyside_{pair_idx:03d}.png")
+                cv2.imwrite(new_path, cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
+                results.append(new_path)
     
-    status_output = gr.Textbox(label="정보", lines=1)
+    if not results:
+        return None, "처리된 결과가 없습니다"
     
-    dissolve_btn.click(create_dissolve_video, [before_input, after_input, logo_input], [video_output, status_output])
-    sidebyside_btn.click(create_sidebyside, [before_input, after_input, logo_input], [image_output, status_output])
+    # ZIP으로 묶기
+    zip_path = os.path.join(temp, "batch_results.zip")
+    with zipfile.ZipFile(zip_path, 'w') as zf:
+        for r in results:
+            zf.write(r, os.path.basename(r))
+    
+    return zip_path, f"{len(results)}개 처리 완료"
+
+# ===== UI =====
+with gr.Blocks(title="Dental B&A", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🦷 치과 전후 비교")
+    gr.Markdown("안모/반모/구강 자동 감지 → 균형 스케일 정렬")
+    
+    with gr.Tabs():
+        # 단일 처리 탭
+        with gr.Tab("단일 처리"):
+            with gr.Row():
+                before_input = gr.Image(label="BEFORE", type="numpy")
+                after_input = gr.Image(label="AFTER", type="numpy")
+            
+            with gr.Accordion("로고 (선택)", open=False):
+                logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
+            
+            with gr.Row():
+                dissolve_btn = gr.Button("🎬 디졸브 영상", variant="primary")
+                sidebyside_btn = gr.Button("🖼️ 좌우 비교")
+            
+            with gr.Row():
+                video_out = gr.Video(label="영상")
+                image_out = gr.Image(label="이미지")
+            
+            status_out = gr.Textbox(label="정보")
+            
+            dissolve_btn.click(create_dissolve, [before_input, after_input, logo_input], [video_out, status_out])
+            sidebyside_btn.click(create_sidebyside, [before_input, after_input, logo_input], [image_out, status_out])
+        
+        # 배치 처리 탭
+        with gr.Tab("배치 처리"):
+            gr.Markdown("파일명 순서대로 before/after 쌍으로 처리됩니다.\n\n예: `01_before.jpg, 01_after.jpg, 02_before.jpg, 02_after.jpg`")
+            
+            batch_files = gr.File(label="이미지 파일들", file_count="multiple", file_types=["image"])
+            batch_type = gr.Radio(["디졸브", "좌우비교"], value="디졸브", label="출력 형식")
+            batch_logo = gr.Image(label="로고 (선택)", type="numpy")
+            
+            batch_btn = gr.Button("배치 처리 시작", variant="primary")
+            batch_out = gr.File(label="결과 (ZIP)")
+            batch_status = gr.Textbox(label="상태")
+            
+            batch_btn.click(process_batch, [batch_files, batch_type, batch_logo], [batch_out, batch_status])
 
 demo.launch()
