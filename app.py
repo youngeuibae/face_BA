@@ -4,246 +4,350 @@ import numpy as np
 import tempfile
 import os
 
-TARGET_W = 1080   # 9:16 기준 너비
-TARGET_H = 1920   # 9:16 기준 높이
-MAX_SIZE = 1920
+MAX_SIZE = 4096  # 원본 해상도 최대한 보존
 
-# ── 유틸 ──────────────────────────────────────────────────────────────────────
 
-def resize_if_needed(img):
+# ─────────────────────────────────────────
+# 유틸리티
+# ─────────────────────────────────────────
+
+def resize_if_needed(img, max_size=MAX_SIZE):
+    """극단적으로 큰 이미지만 리사이즈"""
     h, w = img.shape[:2]
-    if max(h, w) > MAX_SIZE:
-        scale = MAX_SIZE / max(h, w)
-        img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LANCZOS4)
-    return img
+    if max(h, w) <= max_size:
+        return img
+    if w >= h:
+        new_w, new_h = max_size, int(h * max_size / w)
+    else:
+        new_h, new_w = max_size, int(w * max_size / h)
+    return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-def pad_to_9_16(img, target_w=TARGET_W, target_h=TARGET_H):
-    """원본 비율 유지 + 9:16 캔버스에 맞게 패딩(흰색)"""
+
+def scale_before_to_after_height(before, after):
+    """
+    비포를 애프터와 동일한 높이로 스케일 (비율 유지, 크롭 없음).
+    랜드마크 좌표계를 동일하게 맞추기 위해 필요.
+    """
+    bh, bw = before.shape[:2]
+    ah = after.shape[0]
+    if bh == ah:
+        return before
+    new_w = int(round(bw * ah / bh))
+    return cv2.resize(before, (new_w, ah), interpolation=cv2.INTER_LANCZOS4)
+
+
+def pad_to_9_16(img, bg_color=(255, 255, 255)):
+    """
+    9:16 비율(세로형)이 되도록 흰 여백 추가.
+    두 이미지가 동일 사이즈이면 동일한 패딩이 적용되어 정렬이 유지됨.
+    """
     h, w = img.shape[:2]
-    scale = min(target_w / w, target_h / h)
-    nw, nh = int(w * scale), int(h * scale)
-    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
-    canvas = np.full((target_h, target_w, 3), 255, dtype=np.uint8)
-    y0 = (target_h - nh) // 2
-    x0 = (target_w - nw) // 2
-    canvas[y0:y0+nh, x0:x0+nw] = resized
-    return canvas
+    target_ratio = 9.0 / 16.0  # 0.5625
+    current_ratio = w / h
 
-# ── 얼굴 랜드마크 ─────────────────────────────────────────────────────────────
+    if abs(current_ratio - target_ratio) < 5e-4:
+        return img
 
-def get_face_info(img):
-    try:
-        import mediapipe as mp
-        mp_face_mesh = mp.solutions.face_mesh
-        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1,
-                                    min_detection_confidence=0.1,
-                                    min_tracking_confidence=0.1) as face_mesh:
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = face_mesh.process(rgb)
-            if results.multi_face_landmarks:
-                lm = results.multi_face_landmarks[0].landmark
-                h, w = img.shape[:2]
+    if current_ratio > target_ratio:
+        # 현재 더 가로 → 높이 추가
+        new_h = int(round(w * 16 / 9))
+        pad_t = (new_h - h) // 2
+        pad_b = new_h - h - pad_t
+        pad_l = pad_r = 0
+    else:
+        # 현재 더 세로 → 너비 추가
+        new_w = int(round(h * 9 / 16))
+        pad_l = (new_w - w) // 2
+        pad_r = new_w - w - pad_l
+        pad_t = pad_b = 0
 
-                # 눈
-                left_eye_idx  = [33, 133, 160, 159, 158, 144, 145, 153]
-                right_eye_idx = [362, 263, 387, 386, 385, 373, 374, 380]
-                le_x = np.mean([lm[i].x for i in left_eye_idx]) * w
-                le_y = np.mean([lm[i].y for i in left_eye_idx]) * h
-                re_x = np.mean([lm[i].x for i in right_eye_idx]) * w
-                re_y = np.mean([lm[i].y for i in right_eye_idx]) * h
-                eye_cx = (le_x + re_x) / 2
-                eye_cy = (le_y + re_y) / 2
-                eye_dist  = np.hypot(re_x - le_x, re_y - le_y)
-                eye_angle = np.arctan2(re_y - le_y, re_x - le_x)
-
-                # 입
-                mouth_idx = [61, 291, 0, 17]
-                mouth_cx = np.mean([lm[i].x for i in mouth_idx]) * w
-                mouth_cy = np.mean([lm[i].y for i in mouth_idx]) * h
-
-                # 코 끝
-                nose_x = lm[4].x * w
-                nose_y = lm[4].y * h
-
-                # 안모/반모 판별
-                xs = [lm[i].x * w for i in [10, 152, 234, 454]]
-                ys = [lm[i].y * h for i in [10, 152, 234, 454]]
-                face_h = max(ys) - min(ys)
-                face_w = max(xs) - min(xs)
-                is_half = (face_h / face_w if face_w > 0 else 1.0) < 0.9
-
-                return dict(
-                    eye_dist=eye_dist, eye_angle=eye_angle,
-                    eye_cx=eye_cx, eye_cy=eye_cy,
-                    mouth_cx=mouth_cx, mouth_cy=mouth_cy,
-                    nose_x=nose_x, nose_y=nose_y,
-                    is_half=is_half, detected=True
-                )
-    except Exception as e:
-        print(f"MediaPipe error: {e}")
-
-    h, w = img.shape[:2]
-    return dict(
-        eye_dist=w*0.3, eye_angle=0,
-        eye_cx=w/2, eye_cy=h*0.35,
-        mouth_cx=w/2, mouth_cy=h*0.6,
-        nose_x=w/2, nose_y=h*0.5,
-        is_half=True, detected=False
+    return cv2.copyMakeBorder(
+        img, pad_t, pad_b, pad_l, pad_r,
+        cv2.BORDER_CONSTANT, value=bg_color
     )
 
-# ── 정렬 ──────────────────────────────────────────────────────────────────────
 
-def align_before_to_after(before_bgr, after_bgr, bi, ai):
+# ─────────────────────────────────────────
+# 얼굴 랜드마크 검출
+# ─────────────────────────────────────────
+
+def get_face_info(img):
     """
-    before 이미지를 after 기준으로 정렬.
-    - 눈 간격(scale), 눈 기울기(rotate), 눈 중심(translate) 일치
-    - 입 위치도 검증용으로 사용
+    MediaPipe FaceMesh로 랜드마크 검출.
+    안모(정면): 눈 간격·기울기·중심 사용
+    반모(측면): 코끝~턱 정중선 사용
     """
-    # 스케일: after 눈 간격 / before 눈 간격
-    scale = np.clip(ai['eye_dist'] / bi['eye_dist'], 0.7, 1.4)
+    try:
+        import mediapipe as mp
+        h, w = img.shape[:2]
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # 회전: 눈 기울기 차이
-    angle_deg = np.clip(-np.degrees(ai['eye_angle'] - bi['eye_angle']), -15, 15)
+        with mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True, max_num_faces=1,
+            min_detection_confidence=0.1, min_tracking_confidence=0.1
+        ) as fm:
+            res = fm.process(rgb)
+            if not res.multi_face_landmarks:
+                raise RuntimeError("no face")
 
-    # 앵커: before 눈 중심 → after 눈 중심으로
-    ax, ay = bi['eye_cx'], bi['eye_cy']
-    tx, ty = ai['eye_cx'], ai['eye_cy']
+            lm = res.multi_face_landmarks[0].landmark
 
-    M = cv2.getRotationMatrix2D((ax, ay), angle_deg, scale)
-    # 변환 후 앵커 좌표
-    nax = M[0,0]*ax + M[0,1]*ay + M[0,2]
-    nay = M[1,0]*ax + M[1,1]*ay + M[1,2]
-    # 타겟으로 평행이동
-    M[0,2] += tx - nax
-    M[1,2] += ty - nay
+            # ── 눈 (안모) ──
+            L_IDX = [33, 133, 160, 159, 158, 144, 145, 153]
+            R_IDX = [362, 263, 387, 386, 385, 373, 374, 380]
+            lx = np.mean([lm[i].x for i in L_IDX]) * w
+            ly = np.mean([lm[i].y for i in L_IDX]) * h
+            rx = np.mean([lm[i].x for i in R_IDX]) * w
+            ry = np.mean([lm[i].y for i in R_IDX]) * h
 
-    h, w = after_bgr.shape[:2]
-    aligned = cv2.warpAffine(before_bgr, M, (w, h),
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(255, 255, 255))
-    return aligned
+            eye_dist  = np.hypot(rx - lx, ry - ly)
+            eye_angle = np.arctan2(ry - ly, rx - lx)
+            eyes_cx   = (lx + rx) / 2
+            eyes_cy   = (ly + ry) / 2
 
-# ── 밝기 보정 ──────────────────────────────────────────────────────────────────
+            # ── 정중선 (반모) ──
+            nose_x, nose_y = lm[4].x * w,   lm[4].y * h
+            chin_x, chin_y = lm[152].x * w, lm[152].y * h
+            ul_x,   ul_y   = lm[0].x * w,   lm[0].y * h
+            ll_x,   ll_y   = lm[17].x * w,  lm[17].y * h
+
+            midline_len = np.hypot(chin_x - nose_x, chin_y - nose_y)
+            midline_ang = np.arctan2(chin_y - nose_y, chin_x - nose_x)
+            mid_cx = (ul_x + ll_x) / 2
+            mid_cy = (ul_y + ll_y) / 2
+
+            # ── 안모 / 반모 판별 ──
+            # 얼굴 경계 4점의 세로폭 / 가로폭 비율
+            pts   = [10, 152, 234, 454]
+            xs    = [lm[i].x * w for i in pts]
+            ys    = [lm[i].y * h for i in pts]
+            face_w = max(xs) - min(xs)
+            face_h = max(ys) - min(ys)
+            is_half = (face_h / (face_w + 1e-6)) < 0.85
+
+            return dict(
+                eye_dist=eye_dist, eye_angle=eye_angle,
+                eyes_cx=eyes_cx, eyes_cy=eyes_cy,
+                midline_len=midline_len, midline_ang=midline_ang,
+                mid_cx=mid_cx, mid_cy=mid_cy,
+                is_half=is_half, detected=True
+            )
+
+    except Exception as e:
+        print(f"[FaceInfo] {e}")
+
+    # 검출 실패 시 기본값 (이미지 중앙 기준)
+    h, w = img.shape[:2]
+    return dict(
+        eye_dist=w * 0.30, eye_angle=0.0,
+        eyes_cx=w / 2,     eyes_cy=h * 0.35,
+        midline_len=h * 0.30, midline_ang=np.pi / 2,
+        mid_cx=w / 2,     mid_cy=h * 0.60,
+        is_half=False, detected=False
+    )
+
+
+# ─────────────────────────────────────────
+# 정렬 (비포 → 애프터 기준)
+# ─────────────────────────────────────────
+
+def align_before_to_after(before, after, bi, ai):
+    """
+    비포 이미지를 애프터 이미지의 얼굴 위치에 맞게 변환.
+    변환: 스케일 + 회전 (비포 앵커 기준) + 이동 (애프터 앵커로)
+
+    [안모] 눈 간격(스케일), 눈 기울기(회전), 눈 중심(이동)
+    [반모] 정중선 길이(스케일), 정중선 각도(회전), 입술 중심(이동)
+    """
+    is_half = ai['is_half']
+
+    if is_half:
+        scale    = float(np.clip(ai['midline_len'] / (bi['midline_len'] + 1e-6), 0.6, 1.6))
+        d_angle  = ai['midline_ang'] - bi['midline_ang']
+        bx, by   = bi['mid_cx'],   bi['mid_cy']
+        tx, ty   = ai['mid_cx'],   ai['mid_cy']
+        label    = "반모(정중선)"
+    else:
+        scale    = float(np.clip(ai['eye_dist'] / (bi['eye_dist'] + 1e-6), 0.6, 1.6))
+        d_angle  = ai['eye_angle'] - bi['eye_angle']
+        bx, by   = bi['eyes_cx'],  bi['eyes_cy']
+        tx, ty   = ai['eyes_cx'],  ai['eyes_cy']
+        label    = "안모(눈)"
+
+    # OpenCV 이미지 좌표(y-down)에서 arctan2 각도는 시계방향 증가.
+    # getRotationMatrix2D 양수각 = 수학적 반시계 = 화면에서 시계방향.
+    # 따라서 보정각에 부호를 반전.
+    angle_deg = float(np.clip(-np.degrees(d_angle), -25.0, 25.0))
+
+    # 비포 앵커 기준 회전+스케일 → 애프터 앵커로 이동
+    M = cv2.getRotationMatrix2D((bx, by), angle_deg, scale)
+
+    new_bx = M[0, 0] * bx + M[0, 1] * by + M[0, 2]
+    new_by = M[1, 0] * bx + M[1, 1] * by + M[1, 2]
+    M[0, 2] += tx - new_bx
+    M[1, 2] += ty - new_by
+
+    h, w = after.shape[:2]
+    aligned = cv2.warpAffine(
+        before, M, (w, h),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255)
+    )
+    return aligned, label
+
+
+# ─────────────────────────────────────────
+# 밝기 맞춤
+# ─────────────────────────────────────────
 
 def match_brightness(img1, img2):
+    """LAB 색공간에서 두 이미지의 평균 밝기를 동일하게 조정"""
     lab1 = cv2.cvtColor(img1, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab2 = cv2.cvtColor(img2, cv2.COLOR_BGR2LAB).astype(np.float32)
-    avg = (np.mean(lab1[:,:,0]) + np.mean(lab2[:,:,0])) / 2
-    lab1[:,:,0] = np.clip(lab1[:,:,0] + (avg - np.mean(lab1[:,:,0])), 0, 255)
-    lab2[:,:,0] = np.clip(lab2[:,:,0] + (avg - np.mean(lab2[:,:,0])), 0, 255)
-    r1 = cv2.cvtColor(lab1.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    r2 = cv2.cvtColor(lab2.astype(np.uint8), cv2.COLOR_LAB2BGR)
-    return r1, r2
+    avg_l = (np.mean(lab1[:, :, 0]) + np.mean(lab2[:, :, 0])) / 2
+    lab1[:, :, 0] = np.clip(lab1[:, :, 0] + (avg_l - np.mean(lab1[:, :, 0])), 0, 255)
+    lab2[:, :, 0] = np.clip(lab2[:, :, 0] + (avg_l - np.mean(lab2[:, :, 0])), 0, 255)
+    out1 = cv2.cvtColor(lab1.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    out2 = cv2.cvtColor(lab2.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return out1, out2
 
-# ── 로고 ───────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────
+# 로고 합성
+# ─────────────────────────────────────────
 
 def add_logo(frame, logo, margin_ratio=0.03, width_ratio=0.27):
     if logo is None:
         return frame
     h, w = frame.shape[:2]
     lw = int(w * width_ratio)
-    lh = int(logo.shape[0] * (lw / logo.shape[1]))
+    lh = int(logo.shape[0] * lw / logo.shape[1])
     logo_r = cv2.resize(logo, (lw, lh), interpolation=cv2.INTER_LANCZOS4)
     m = int(w * margin_ratio)
-    if logo_r.shape[2] == 4:
-        alpha = logo_r[:,:,3:4] / 255.0
-        roi = frame[m:m+lh, m:m+lw]
-        frame[m:m+lh, m:m+lw] = (logo_r[:,:,:3] * alpha + roi * (1 - alpha)).astype(np.uint8)
+    y1, y2 = m, min(m + lh, h)
+    x1, x2 = m, min(m + lw, w)
+    lh_c, lw_c = y2 - y1, x2 - x1
+
+    if logo_r.ndim == 3 and logo_r.shape[2] == 4:
+        alpha = logo_r[:lh_c, :lw_c, 3:4] / 255.0
+        rgb   = logo_r[:lh_c, :lw_c, :3]
+        roi   = frame[y1:y2, x1:x2]
+        frame[y1:y2, x1:x2] = (rgb * alpha + roi * (1 - alpha)).astype(np.uint8)
     else:
-        frame[m:m+lh, m:m+lw] = logo_r
+        frame[y1:y2, x1:x2] = logo_r[:lh_c, :lw_c]
     return frame
 
-# ── 메인 ───────────────────────────────────────────────────────────────────────
 
-def create_video(before_img, after_img, logo_img=None):
+# ─────────────────────────────────────────
+# 메인 처리 함수
+# ─────────────────────────────────────────
+
+def process_images(before_img, after_img, logo_img=None):
+    """
+    반환: (before_path, after_path, preview_numpy, status_str)
+    """
     if before_img is None or after_img is None:
-        return None, "전/후 사진을 모두 업로드해주세요"
+        return None, None, None, "전/후 사진을 모두 업로드해주세요"
 
     try:
+        # ── BGR 변환 ──
         before = cv2.cvtColor(before_img, cv2.COLOR_RGB2BGR)
         after  = cv2.cvtColor(after_img,  cv2.COLOR_RGB2BGR)
 
-        # 1) 최대 크기 제한
+        # ── 극단적 고해상도만 리사이즈 ──
         before = resize_if_needed(before)
         after  = resize_if_needed(after)
 
-        # 2) 각각 9:16 캔버스로 패딩 (원본 해상도 최대 활용)
-        #    after 기준 해상도 결정
-        ah, aw = after.shape[:2]
-        # 9:16 캔버스 크기: after 원본을 담을 수 있는 최소 9:16
-        if aw / ah < 9/16:
-            cw = int(ah * 9 / 16)
-            ch = ah
-        else:
-            cw = aw
-            ch = int(aw * 16 / 9)
-        # 짝수 맞춤
-        cw = (cw // 2) * 2
-        ch = (ch // 2) * 2
-
-        after_canvas  = pad_to_9_16(after,  cw, ch)
-        before_canvas = pad_to_9_16(before, cw, ch)
-
-        # 3) 얼굴 랜드마크 (패딩 후 이미지 기준)
-        bi = get_face_info(before_canvas)
-        ai = get_face_info(after_canvas)
-
-        # 4) before → after 기준으로 정렬
-        if bi['detected'] and ai['detected']:
-            before_aligned = align_before_to_after(before_canvas, after_canvas, bi, ai)
-            align_note = "눈 기준 정렬 ✓"
-        else:
-            before_aligned = before_canvas
-            align_note = f"얼굴 미검출(before:{bi['detected']} after:{ai['detected']}) – 정렬 생략"
-
-        # 5) 밝기 보정
-        bf, af = match_brightness(before_aligned, after_canvas)
-
-        # 6) 영상 생성
-        fps = 30
-        before_frames, dissolve_frames, after_frames = 39, 12, 39
-        total_frames = before_frames + dissolve_frames + after_frames
-
-        temp_dir = tempfile.mkdtemp()
-        output_path = os.path.join(temp_dir, "dental_comparison.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (cw, ch))
-
+        # ── 로고 처리 ──
         logo = None
         if logo_img is not None:
-            logo = (cv2.cvtColor(logo_img, cv2.COLOR_RGBA2BGRA)
-                    if logo_img.shape[2] == 4
-                    else cv2.cvtColor(logo_img, cv2.COLOR_RGB2BGR))
+            ch = logo_img.shape[2] if logo_img.ndim == 3 else 1
+            conv = cv2.COLOR_RGBA2BGRA if ch == 4 else cv2.COLOR_RGB2BGR
+            logo = cv2.cvtColor(logo_img, conv)
 
-        for i in range(total_frames):
-            if i < before_frames:
-                frame = bf.copy()
-            elif i < before_frames + dissolve_frames:
-                a = (i - before_frames) / dissolve_frames
-                frame = cv2.addWeighted(bf, 1-a, af, a, 0)
-            else:
-                frame = af.copy()
-            if logo is not None:
-                frame = add_logo(frame, logo)
-            out.write(frame)
+        # ── 비포를 애프터와 같은 높이로 스케일 (좌표계 통일) ──
+        before_s = scale_before_to_after_height(before, after)
 
-        out.release()
-        return output_path, f"해상도: {cw}×{ch} | 비율: 9:16 | {align_note}"
+        # ── 얼굴 랜드마크 검출 ──
+        bi = get_face_info(before_s)
+        ai = get_face_info(after)
+
+        # ── 비포를 애프터 기준으로 정렬 ──
+        before_aligned, align_type = align_before_to_after(before_s, after, bi, ai)
+
+        # ── 밝기 통일 ──
+        before_b, after_b = match_brightness(before_aligned, after.copy())
+
+        # ── 9:16 패딩 (두 이미지 동일 사이즈 → 동일 패딩 → 정렬 유지) ──
+        before_out = pad_to_9_16(before_b)
+        after_out  = pad_to_9_16(after_b)
+
+        # ── 로고 합성 ──
+        if logo is not None:
+            before_out = add_logo(before_out.copy(), logo)
+            after_out  = add_logo(after_out.copy(),  logo)
+
+        # ── PNG 저장 ──
+        tmp = tempfile.mkdtemp()
+        bp  = os.path.join(tmp, "before_aligned.png")
+        ap  = os.path.join(tmp, "after_aligned.png")
+        cv2.imwrite(bp, before_out, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        cv2.imwrite(ap, after_out,  [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+        # ── 미리보기 (좌우 합성, 최대 높이 960px) ──
+        ph   = min(960, before_out.shape[0])
+        pw_b = int(before_out.shape[1] * ph / before_out.shape[0])
+        pw_a = int(after_out.shape[1]  * ph / after_out.shape[0])
+        b_p  = cv2.resize(before_out, (pw_b, ph))
+        a_p  = cv2.resize(after_out,  (pw_a, ph))
+
+        lh = 44
+        canvas = np.full((ph + lh, pw_b + pw_a, 3), 255, dtype=np.uint8)
+        canvas[lh:, :pw_b] = b_p
+        canvas[lh:, pw_b:] = a_p
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(canvas, "BEFORE",
+                    (pw_b // 2 - 55, 30), font, 1.0, (80, 80, 80), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "AFTER",
+                    (pw_b + pw_a // 2 - 44, 30), font, 1.0, (80, 80, 80), 2, cv2.LINE_AA)
+
+        preview_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+        # ── 상태 메시지 ──
+        bh, bw = before_out.shape[:2]
+        ah, aw = after_out.shape[:2]
+        db = "✓" if bi['detected'] else "✗"
+        da = "✓" if ai['detected'] else "✗"
+        status = (
+            f"BEFORE: {bw}×{bh}px | AFTER: {aw}×{ah}px\n"
+            f"정렬 방식: {align_type} | 얼굴 검출: 전({db}) 후({da})"
+        )
+
+        return bp, ap, preview_rgb, status
 
     except Exception as e:
         import traceback
-        return None, f"오류: {str(e)}\n{traceback.format_exc()}"
+        return None, None, None, f"오류: {str(e)}\n{traceback.format_exc()}"
 
-# ── UI ────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────
+# Gradio UI
+# ─────────────────────────────────────────
 
 custom_css = """
-.gradio-container { max-width: 900px !important; margin: auto !important; }
+.gradio-container { max-width: 1000px !important; margin: auto !important; }
 footer { display: none !important; }
 """
 
 with gr.Blocks(title="Dental B&A", css=custom_css) as demo:
     gr.Markdown("<h1 style='text-align:center'>🦷 치과 전후 비교</h1>")
-    gr.Markdown("<p style='text-align:center;color:#666'>9:16 비율 · 원본 해상도 유지 · 얼굴 자동 정렬</p>")
+    gr.Markdown(
+        "<p style='text-align:center;color:#666'>"
+        "사진 업로드 → 얼굴 자동 정렬 → 9:16 PNG 저장"
+        "</p>"
+    )
 
     with gr.Row():
         before_input = gr.Image(label="BEFORE", type="numpy")
@@ -252,16 +356,19 @@ with gr.Blocks(title="Dental B&A", css=custom_css) as demo:
     with gr.Accordion("로고 추가 (선택)", open=False):
         logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
 
-    generate_btn = gr.Button("영상 생성", variant="primary")
+    generate_btn = gr.Button("이미지 생성", variant="primary", size="lg")
+
+    preview_output = gr.Image(label="미리보기 (BEFORE | AFTER)", type="numpy")
+    status_output  = gr.Textbox(label="정보", lines=3)
 
     with gr.Row():
-        video_output  = gr.Video(label="결과")
-        status_output = gr.Textbox(label="정보", lines=4)
+        before_dl = gr.File(label="📥 BEFORE 다운로드 (PNG)")
+        after_dl  = gr.File(label="📥 AFTER 다운로드 (PNG)")
 
     generate_btn.click(
-        fn=create_video,
+        fn=process_images,
         inputs=[before_input, after_input, logo_input],
-        outputs=[video_output, status_output]
+        outputs=[before_dl, after_dl, preview_output, status_output]
     )
 
-demo.launch(css=custom_css)
+demo.launch()
