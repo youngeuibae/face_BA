@@ -4,7 +4,7 @@ import numpy as np
 import tempfile
 import os
 
-MAX_SIZE = 4096  # 원본 해상도 최대한 보존
+MAX_SIZE = 4096  # 극단적 고해상도만 제한
 
 
 # ─────────────────────────────────────────
@@ -23,10 +23,10 @@ def resize_if_needed(img, max_size=MAX_SIZE):
     return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
 
-def scale_before_to_after_height(before, after):
+def scale_before_to_after_resolution(before, after):
     """
-    비포를 애프터와 동일한 높이로 스케일 (비율 유지, 크롭 없음).
-    랜드마크 좌표계를 동일하게 맞추기 위해 필요.
+    비포를 애프터와 동일한 높이로 스케일 (비율 유지).
+    랜드마크 좌표계를 통일하기 위해 필요.
     """
     bh, bw = before.shape[:2]
     ah = after.shape[0]
@@ -36,35 +36,37 @@ def scale_before_to_after_height(before, after):
     return cv2.resize(before, (new_w, ah), interpolation=cv2.INTER_LANCZOS4)
 
 
-def pad_to_9_16(img, bg_color=(255, 255, 255)):
+def crop_to_9_16(img, face_cx, face_cy):
     """
-    9:16 비율(세로형)이 되도록 흰 여백 추가.
-    두 이미지가 동일 사이즈이면 동일한 패딩이 적용되어 정렬이 유지됨.
+    9:16 비율(세로형)로 크롭 영역 계산. 얼굴 중심 기준.
+    정렬된 두 이미지에 동일한 (x1, y1) 크롭을 적용하면 정렬이 유지됨.
+    반환: (x1, y1, crop_w, crop_h)
     """
     h, w = img.shape[:2]
-    target_ratio = 9.0 / 16.0  # 0.5625
-    current_ratio = w / h
+    ratio = 9.0 / 16.0  # width / height
 
-    if abs(current_ratio - target_ratio) < 5e-4:
-        return img
-
-    if current_ratio > target_ratio:
-        # 현재 더 가로 → 높이 추가
-        new_h = int(round(w * 16 / 9))
-        pad_t = (new_h - h) // 2
-        pad_b = new_h - h - pad_t
-        pad_l = pad_r = 0
+    if w / h > ratio:
+        # 현재 더 가로 → 너비 크롭
+        new_h = h
+        new_w = int(round(h * ratio))
     else:
-        # 현재 더 세로 → 너비 추가
-        new_w = int(round(h * 9 / 16))
-        pad_l = (new_w - w) // 2
-        pad_r = new_w - w - pad_l
-        pad_t = pad_b = 0
+        # 현재 더 세로 → 높이 크롭
+        new_w = w
+        new_h = int(round(w / ratio))
 
-    return cv2.copyMakeBorder(
-        img, pad_t, pad_b, pad_l, pad_r,
-        cv2.BORDER_CONSTANT, value=bg_color
-    )
+    # 짝수 보장
+    new_w = (new_w // 2) * 2
+    new_h = (new_h // 2) * 2
+
+    # 얼굴 중심 기준 크롭 위치
+    x1 = int(face_cx - new_w / 2)
+    y1 = int(face_cy - new_h * 0.38)  # 얼굴을 상단 38% 지점에 배치
+
+    # 이미지 경계 클램핑
+    x1 = max(0, min(x1, w - new_w))
+    y1 = max(0, min(y1, h - new_h))
+
+    return x1, y1, new_w, new_h
 
 
 # ─────────────────────────────────────────
@@ -76,6 +78,7 @@ def get_face_info(img):
     MediaPipe FaceMesh로 랜드마크 검출.
     안모(정면): 눈 간격·기울기·중심 사용
     반모(측면): 코끝~턱 정중선 사용
+    + 얼굴 중심점 (9:16 크롭용)
     """
     try:
         import mediapipe as mp
@@ -116,8 +119,11 @@ def get_face_info(img):
             mid_cx = (ul_x + ll_x) / 2
             mid_cy = (ul_y + ll_y) / 2
 
+            # ── 얼굴 중심 (크롭용) ──
+            face_cx = eyes_cx * 0.5 + nose_x * 0.3 + chin_x * 0.2
+            face_cy = eyes_cy * 0.3 + nose_y * 0.3 + chin_y * 0.4
+
             # ── 안모 / 반모 판별 ──
-            # 얼굴 경계 4점의 세로폭 / 가로폭 비율
             pts   = [10, 152, 234, 454]
             xs    = [lm[i].x * w for i in pts]
             ys    = [lm[i].y * h for i in pts]
@@ -130,6 +136,7 @@ def get_face_info(img):
                 eyes_cx=eyes_cx, eyes_cy=eyes_cy,
                 midline_len=midline_len, midline_ang=midline_ang,
                 mid_cx=mid_cx, mid_cy=mid_cy,
+                face_cx=face_cx, face_cy=face_cy,
                 is_half=is_half, detected=True
             )
 
@@ -142,7 +149,8 @@ def get_face_info(img):
         eye_dist=w * 0.30, eye_angle=0.0,
         eyes_cx=w / 2,     eyes_cy=h * 0.35,
         midline_len=h * 0.30, midline_ang=np.pi / 2,
-        mid_cx=w / 2,     mid_cy=h * 0.60,
+        mid_cx=w / 2,      mid_cy=h * 0.60,
+        face_cx=w / 2,     face_cy=h * 0.45,
         is_half=False, detected=False
     )
 
@@ -174,9 +182,6 @@ def align_before_to_after(before, after, bi, ai):
         tx, ty   = ai['eyes_cx'],  ai['eyes_cy']
         label    = "안모(눈)"
 
-    # OpenCV 이미지 좌표(y-down)에서 arctan2 각도는 시계방향 증가.
-    # getRotationMatrix2D 양수각 = 수학적 반시계 = 화면에서 시계방향.
-    # 따라서 보정각에 부호를 반전.
     angle_deg = float(np.clip(-np.degrees(d_angle), -25.0, 25.0))
 
     # 비포 앵커 기준 회전+스케일 → 애프터 앵커로 이동
@@ -191,8 +196,7 @@ def align_before_to_after(before, after, bi, ai):
     aligned = cv2.warpAffine(
         before, M, (w, h),
         flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(255, 255, 255)
+        borderMode=cv2.BORDER_REFLECT_101
     )
     return aligned, label
 
@@ -229,6 +233,9 @@ def add_logo(frame, logo, margin_ratio=0.03, width_ratio=0.27):
     x1, x2 = m, min(m + lw, w)
     lh_c, lw_c = y2 - y1, x2 - x1
 
+    if lh_c <= 0 or lw_c <= 0:
+        return frame
+
     if logo_r.ndim == 3 and logo_r.shape[2] == 4:
         alpha = logo_r[:lh_c, :lw_c, 3:4] / 255.0
         rgb   = logo_r[:lh_c, :lw_c, :3]
@@ -245,6 +252,7 @@ def add_logo(frame, logo, margin_ratio=0.03, width_ratio=0.27):
 
 def process_images(before_img, after_img, logo_img=None):
     """
+    1. 얼굴 검출 → 2. 정렬 → 3. 밝기 맞춤 → 4. 9:16 크롭 → 5. PNG 저장
     반환: (before_path, after_path, preview_numpy, status_str)
     """
     if before_img is None or after_img is None:
@@ -254,6 +262,8 @@ def process_images(before_img, after_img, logo_img=None):
         # ── BGR 변환 ──
         before = cv2.cvtColor(before_img, cv2.COLOR_RGB2BGR)
         after  = cv2.cvtColor(after_img,  cv2.COLOR_RGB2BGR)
+
+        orig_h, orig_w = after.shape[:2]
 
         # ── 극단적 고해상도만 리사이즈 ──
         before = resize_if_needed(before)
@@ -267,7 +277,7 @@ def process_images(before_img, after_img, logo_img=None):
             logo = cv2.cvtColor(logo_img, conv)
 
         # ── 비포를 애프터와 같은 높이로 스케일 (좌표계 통일) ──
-        before_s = scale_before_to_after_height(before, after)
+        before_s = scale_before_to_after_resolution(before, after)
 
         # ── 얼굴 랜드마크 검출 ──
         bi = get_face_info(before_s)
@@ -279,14 +289,15 @@ def process_images(before_img, after_img, logo_img=None):
         # ── 밝기 통일 ──
         before_b, after_b = match_brightness(before_aligned, after.copy())
 
-        # ── 9:16 패딩 (두 이미지 동일 사이즈 → 동일 패딩 → 정렬 유지) ──
-        before_out = pad_to_9_16(before_b)
-        after_out  = pad_to_9_16(after_b)
+        # ── 9:16 크롭 (얼굴 중심 기준, 두 이미지에 동일 적용 → 정렬 유지) ──
+        x1, y1, cw, ch = crop_to_9_16(after_b, ai['face_cx'], ai['face_cy'])
+        before_out = before_b[y1:y1+ch, x1:x1+cw].copy()
+        after_out  = after_b[y1:y1+ch, x1:x1+cw].copy()
 
         # ── 로고 합성 ──
         if logo is not None:
-            before_out = add_logo(before_out.copy(), logo)
-            after_out  = add_logo(after_out.copy(),  logo)
+            before_out = add_logo(before_out, logo)
+            after_out  = add_logo(after_out,  logo)
 
         # ── PNG 저장 ──
         tmp = tempfile.mkdtemp()
@@ -302,27 +313,28 @@ def process_images(before_img, after_img, logo_img=None):
         b_p  = cv2.resize(before_out, (pw_b, ph))
         a_p  = cv2.resize(after_out,  (pw_a, ph))
 
-        lh = 44
-        canvas = np.full((ph + lh, pw_b + pw_a, 3), 255, dtype=np.uint8)
-        canvas[lh:, :pw_b] = b_p
-        canvas[lh:, pw_b:] = a_p
+        sep = 4  # 구분선 두께
+        label_h = 44
+        canvas = np.full((ph + label_h, pw_b + sep + pw_a, 3), 255, dtype=np.uint8)
+        canvas[label_h:, :pw_b] = b_p
+        canvas[label_h:, pw_b:pw_b+sep] = (200, 200, 200)  # 회색 구분선
+        canvas[label_h:, pw_b+sep:] = a_p
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(canvas, "BEFORE",
                     (pw_b // 2 - 55, 30), font, 1.0, (80, 80, 80), 2, cv2.LINE_AA)
         cv2.putText(canvas, "AFTER",
-                    (pw_b + pw_a // 2 - 44, 30), font, 1.0, (80, 80, 80), 2, cv2.LINE_AA)
+                    (pw_b + sep + pw_a // 2 - 44, 30), font, 1.0, (80, 80, 80), 2, cv2.LINE_AA)
 
         preview_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
 
         # ── 상태 메시지 ──
-        bh, bw = before_out.shape[:2]
-        ah, aw = after_out.shape[:2]
+        out_h, out_w = after_out.shape[:2]
         db = "✓" if bi['detected'] else "✗"
         da = "✓" if ai['detected'] else "✗"
         status = (
-            f"BEFORE: {bw}×{bh}px | AFTER: {aw}×{ah}px\n"
-            f"정렬 방식: {align_type} | 얼굴 검출: 전({db}) 후({da})"
+            f"원본: {orig_w}×{orig_h} → 출력: {out_w}×{out_h} (9:16)\n"
+            f"정렬: {align_type} | 얼굴 검출: 전({db}) 후({da})"
         )
 
         return bp, ap, preview_rgb, status
@@ -354,12 +366,12 @@ with gr.Blocks(title="Dental B&A", css=custom_css) as demo:
         after_input  = gr.Image(label="AFTER",  type="numpy")
 
     with gr.Accordion("로고 추가 (선택)", open=False):
-        logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy")
+        logo_input = gr.Image(label="PNG 투명 배경 지원", type="numpy", image_mode="RGBA")
 
     generate_btn = gr.Button("이미지 생성", variant="primary", size="lg")
 
     preview_output = gr.Image(label="미리보기 (BEFORE | AFTER)", type="numpy")
-    status_output  = gr.Textbox(label="정보", lines=3)
+    status_output  = gr.Textbox(label="정보", lines=2)
 
     with gr.Row():
         before_dl = gr.File(label="📥 BEFORE 다운로드 (PNG)")
